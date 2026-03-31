@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Import photos from an SD card into ~/Pictures organized by date.
+Import photos from a Fuji SD card into ~/Pictures organized by date.
 
 Directory structure: ~/Pictures/{year}/{month}/{day}/{filename}
 
@@ -14,116 +14,36 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+
+from pipeline import (
+    PICTURES_DIR,
+    FileContext,
+    ImportConfig,
+    build_default_pipeline,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-PICTURES_DIR = Path.home() / "Pictures"
 VOLUMES_DIR = Path("/Volumes")
 FILE_EXTENSIONS = {".jpg", ".jpeg", ".raf"}
 DCIM_FUJI_GLOB = "DCIM/*_FUJI"
 EXIFTOOL_BATCH_SIZE = 500
 
 # ---------------------------------------------------------------------------
-# FileContext — carries state for one file through the pipeline
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class FileContext:
-    """All state associated with a single file being processed."""
-
-    src_path: Path
-    dest_path: Path | None = None
-    metadata: dict = field(default_factory=dict)
-    skipped: bool = False
-    skip_reason: str = ""
-
-
-# ---------------------------------------------------------------------------
-# Pipeline
-# ---------------------------------------------------------------------------
-
-StepFn = Callable[[FileContext, "ImportConfig"], None]
-
-
-class Pipeline:
-    """Ordered list of processing steps applied to each file."""
-
-    def __init__(self) -> None:
-        self._steps: list[tuple[str, StepFn]] = []
-
-    def add_step(
-        self,
-        fn: StepFn,
-        name: str | None = None,
-        *,
-        after: str | None = None,
-        before: str | None = None,
-    ) -> None:
-        """Register a step. Optionally place it after/before a named step."""
-        step_name = name or fn.__name__
-        entry = (step_name, fn)
-
-        if after:
-            idx = self._index_of(after)
-            self._steps.insert(idx + 1, entry)
-        elif before:
-            idx = self._index_of(before)
-            self._steps.insert(idx, entry)
-        else:
-            self._steps.append(entry)
-
-    def run(self, ctx: FileContext, config: "ImportConfig") -> None:
-        """Run all steps on a single FileContext. Stops early if skipped."""
-        for step_name, fn in self._steps:
-            if ctx.skipped:
-                return
-            fn(ctx, config)
-
-    @property
-    def step_names(self) -> list[str]:
-        return [name for name, _ in self._steps]
-
-    def _index_of(self, name: str) -> int:
-        for i, (n, _) in enumerate(self._steps):
-            if n == name:
-                return i
-        raise ValueError(
-            f"Pipeline step '{name}' not found. Available: {self.step_names}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Import configuration
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class ImportConfig:
-    source: Path
-    dest_root: Path = PICTURES_DIR
-    dry_run: bool = False
-
-
-# ---------------------------------------------------------------------------
-# Pipeline steps
+# SD-card-specific extract_date step
 # ---------------------------------------------------------------------------
 
 
 def extract_date(ctx: FileContext, config: ImportConfig) -> None:
-    """Read the date from pre-loaded metadata (batch-extracted earlier)."""
+    """Read the date from pre-loaded EXIF metadata (batch-extracted earlier)."""
     raw = ctx.metadata.get("DateTimeOriginal")
     if not raw:
-        # Fallback: use file modification time
         mtime = ctx.src_path.stat().st_mtime
         ctx.metadata["date"] = datetime.fromtimestamp(mtime)
         ctx.metadata["date_source"] = "mtime"
@@ -136,31 +56,6 @@ def extract_date(ctx: FileContext, config: ImportConfig) -> None:
         mtime = ctx.src_path.stat().st_mtime
         ctx.metadata["date"] = datetime.fromtimestamp(mtime)
         ctx.metadata["date_source"] = "mtime"
-
-
-def resolve_target(ctx: FileContext, config: ImportConfig) -> None:
-    """Compute the destination path: ~/Pictures/YYYY/MM/DD/filename."""
-    date: datetime = ctx.metadata["date"]
-    year = f"{date.year}"
-    month = f"{date.month:02d}"
-    day = f"{date.day:02d}"
-    ctx.dest_path = config.dest_root / year / month / day / ctx.src_path.name
-
-
-def check_duplicate(ctx: FileContext, config: ImportConfig) -> None:
-    """Skip if the file already exists at the target location."""
-    if ctx.dest_path and ctx.dest_path.exists():
-        ctx.skipped = True
-        ctx.skip_reason = "already exists"
-
-
-def copy_file(ctx: FileContext, config: ImportConfig) -> None:
-    """Copy the file to the destination, preserving metadata."""
-    if config.dry_run:
-        return
-
-    ctx.dest_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(ctx.src_path, ctx.dest_path)
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +82,6 @@ def batch_extract_exif(files: list[Path]) -> dict[str, dict]:
                 result[src] = entry
         except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
             print(f"  Warning: exiftool batch failed: {e}", file=sys.stderr)
-            # Files in this batch will fall back to mtime
 
     return result
 
@@ -249,16 +143,6 @@ def collect_files(source: Path) -> list[Path]:
 # ---------------------------------------------------------------------------
 
 
-def build_default_pipeline() -> Pipeline:
-    """Construct the default import pipeline."""
-    pipeline = Pipeline()
-    pipeline.add_step(extract_date)
-    pipeline.add_step(resolve_target)
-    pipeline.add_step(check_duplicate)
-    pipeline.add_step(copy_file)
-    return pipeline
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Import photos from SD card")
     parser.add_argument(
@@ -304,8 +188,9 @@ def main() -> None:
     exif_data = batch_extract_exif(files)
     print()
 
-    # Build pipeline and process
+    # Build pipeline: prepend SD-card extract_date before shared steps
     pipeline = build_default_pipeline()
+    pipeline.add_step(extract_date, before="resolve_target")
     config = ImportConfig(source=source, dry_run=args.dry_run)
 
     imported = 0

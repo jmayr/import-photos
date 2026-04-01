@@ -174,9 +174,10 @@ def main() -> None:
             else:
                 imported += 1
                 action = "Would copy" if args.dry_run else "Copied"
+                web = " + web" if ctx.metadata.get("web_path") else ""
                 print(
                     f"  {action} {dest_filename} -> "
-                    f"{ctx.dest_path.relative_to(PICTURES_DIR)}"
+                    f"{ctx.dest_path.relative_to(PICTURES_DIR)}{web}"
                 )
 
     # Summary

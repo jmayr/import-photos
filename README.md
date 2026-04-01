@@ -16,11 +16,17 @@ Both scripts share a common pipeline (`pipeline.py`), so any processing steps yo
         DSCF6979.RAF
         IMG_6868.heic
         ...
+        web/
+          DSCF6979.jpg      # 2048px, JPEG 80%, auto-rotated
+          IMG_6868.jpg       # HEIC → JPEG
     03/
       20/
         DSCF7119.JPG
         IMG_7496.heic
         ...
+        web/
+          DSCF7119.jpg
+          IMG_7496.jpg
 ```
 
 ## Requirements
@@ -28,10 +34,13 @@ Both scripts share a common pipeline (`pipeline.py`), so any processing steps yo
 - Python 3.10+
 - [exiftool](https://exiftool.org/) (for SD card import)
 - [osxphotos](https://github.com/RhetTbull/osxphotos) (for Photos library import)
+- [Pillow](https://python-pillow.org/) + [pillow-heif](https://github.com/bigcat88/pillow_heif) (for web version generation)
+- [anthropic](https://github.com/anthropics/anthropic-sdk-python) (optional, for AI analysis with Claude)
+- [ollama](https://ollama.ai) (optional, for local AI analysis)
 
 ```bash
 brew install exiftool
-pip3 install --user --break-system-packages osxphotos
+pip3 install --user --break-system-packages osxphotos Pillow pillow-heif anthropic
 ```
 
 ## Usage
@@ -62,6 +71,42 @@ python3 import-photos-library.py --dry-run
 python3 import-photos-library.py --library "/path/to/Photos Library.photoslibrary"
 ```
 
+### Generate web versions for existing photos
+
+```bash
+# All photos from 2025
+python3 make-web-versions.py 2025
+
+# Just July 2025
+python3 make-web-versions.py 2025/07
+
+# Preview what would be created
+python3 make-web-versions.py 2025 --dry-run
+```
+
+### Analyze and rate photos with AI
+
+```bash
+# Analyze a single day using Ollama (default, local)
+python3 analyze-day.py 2025/07/15
+
+# Use Claude API (requires API key)
+python3 analyze-day.py 2025/07/15 --provider claude --api-key sk-ant-...
+
+# Use a specific Ollama model
+python3 analyze-day.py 2025/07/15 --provider ollama --model llama3.2-vision
+
+# Limit to first N images (for testing or cost control)
+python3 analyze-day.py 2025/07/15 --limit 20
+```
+
+The analyzer:
+- Rates each image (1.0-10.0 scale)
+- Groups images by visual similarity, location, and time
+- Selects best picks per group (1-3 images for maximum coverage)
+- Generates a markdown summary in the month folder
+- Saves individual `.analysis.json` sidecar files next to each web preview
+
 ## How it works
 
 ### SD card importer
@@ -71,6 +116,7 @@ python3 import-photos-library.py --library "/path/to/Photos Library.photoslibrar
 3. Batch-reads `DateTimeOriginal` from EXIF using exiftool
 4. Copies each file to `~/Pictures/{year}/{month}/{day}/{filename}`
 5. Skips files that already exist at the target path
+6. Creates web-optimized JPEG in `web/` subfolder (see below)
 
 ### Photos library importer
 
@@ -81,6 +127,18 @@ python3 import-photos-library.py --library "/path/to/Photos Library.photoslibrar
 5. Handles RAW+JPEG pairs (both files are imported)
 6. Copies each file to `~/Pictures/{year}/{month}/{day}/{filename}`
 7. Skips files that already exist at the target path
+8. Creates web-optimized JPEG in `web/` subfolder (see below)
+
+### Web versions
+
+After copying, both importers create a web-optimized JPEG for each photo (JPG, HEIC, PNG — not RAW) in a `web/` subfolder next to the original:
+
+- **Max size**: 2048px on the longest edge (never upscales)
+- **Format**: JPEG at 80% quality
+- **Auto-rotated**: EXIF orientation is applied and baked in
+- **Skips**: RAW files (`.raf`) and photos that already have a web version
+
+These are ready to publish to a blog or upload to Instagram.
 
 ### What the scripts do NOT do
 
@@ -99,17 +157,20 @@ import-photos/
   pipeline.py              # shared pipeline, steps, and data types
   import-photos.py         # SD card importer
   import-photos-library.py # Apple Photos importer
+  make-web-versions.py     # generate web versions for existing photos
+  analyze-day.py           # AI-powered photo analysis and grouping
 ```
 
 ## Pipeline architecture
 
 Each file passes through an ordered list of processing steps. The shared default pipeline is defined in `pipeline.py`:
 
-| Step             | Description                                    |
-| ---------------- | ---------------------------------------------- |
-| `resolve_target` | Compute `~/Pictures/YYYY/MM/DD/filename`       |
-| `check_duplicate`| Skip if file already exists at target          |
-| `copy_file`      | Copy with `shutil.copy2` (preserves metadata)  |
+| Step               | Description                                          |
+| ------------------ | ---------------------------------------------------- |
+| `resolve_target`   | Compute `~/Pictures/YYYY/MM/DD/filename`             |
+| `check_duplicate`  | Skip if file already exists at target                |
+| `copy_file`        | Copy with `shutil.copy2` (preserves metadata)        |
+| `make_web_version` | Create 2048px JPEG in `web/` subfolder (skips RAW)   |
 
 Each importer prepends its own `extract_date` step that sets `ctx.metadata["date"]`:
 
@@ -133,6 +194,7 @@ def build_default_pipeline() -> Pipeline:
     pipeline.add_step(resolve_target)
     pipeline.add_step(check_duplicate)
     pipeline.add_step(copy_file)
+    pipeline.add_step(make_web_version)
     pipeline.add_step(my_custom_step)  # runs in both importers
     return pipeline
 ```
@@ -169,5 +231,5 @@ Inspect the current step order:
 
 ```python
 print(pipeline.step_names)
-# ['extract_date', 'resolve_target', 'check_duplicate', 'copy_file']
+# ['extract_date', 'resolve_target', 'check_duplicate', 'copy_file', 'make_web_version']
 ```

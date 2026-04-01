@@ -14,6 +14,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from PIL import Image, ImageOps
+
+# Register HEIC support (pillow-heif)
+try:
+    import pillow_heif
+
+    pillow_heif.register_heif_opener()
+except ImportError:
+    pass  # HEIC support unavailable — only needed for Photos library imports
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -132,6 +142,56 @@ def copy_file(ctx: FileContext, config: ImportConfig) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Web version settings
+# ---------------------------------------------------------------------------
+
+WEB_MAX_SIZE = 2048  # longest edge in pixels
+WEB_QUALITY = 80  # JPEG quality (1-100)
+WEB_SUBDIR = "web"
+WEB_SKIP_EXTENSIONS = {".raf"}  # RAW files — skip, not useful without editing
+WEB_SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".heic", ".png", ".tiff", ".tif"}
+
+
+def make_web_version(ctx: FileContext, config: ImportConfig) -> None:
+    """Create a web-optimized JPEG in a web/ subfolder next to the original.
+
+    - Resizes to fit within 2048x2048 (preserves aspect ratio, never upscales)
+    - Auto-rotates based on EXIF orientation
+    - Converts to RGB JPEG at 80% quality
+    - Skips RAW files (.raf)
+    - Skips if the web version already exists
+    """
+    suffix = ctx.dest_path.suffix.lower()
+    if suffix in WEB_SKIP_EXTENSIONS:
+        return
+    if suffix not in WEB_SUPPORTED_EXTENSIONS:
+        return
+
+    web_dir = ctx.dest_path.parent / WEB_SUBDIR
+    web_path = web_dir / (ctx.dest_path.stem + ".jpg")
+
+    if web_path.exists():
+        return
+
+    ctx.metadata["web_path"] = web_path
+
+    if config.dry_run:
+        return
+
+    web_dir.mkdir(parents=True, exist_ok=True)
+
+    img = Image.open(ctx.dest_path)
+    img = ImageOps.exif_transpose(img)  # auto-rotate
+    img.thumbnail((WEB_MAX_SIZE, WEB_MAX_SIZE), Image.LANCZOS)
+
+    # Ensure RGB (HEIC can be RGBA, CMYK, etc.)
+    if img.mode not in ("RGB",):
+        img = img.convert("RGB")
+
+    img.save(web_path, "JPEG", quality=WEB_QUALITY)
+
+
+# ---------------------------------------------------------------------------
 # Default pipeline
 # ---------------------------------------------------------------------------
 
@@ -147,4 +207,5 @@ def build_default_pipeline() -> Pipeline:
     pipeline.add_step(resolve_target)
     pipeline.add_step(check_duplicate)
     pipeline.add_step(copy_file)
+    pipeline.add_step(make_web_version)
     return pipeline

@@ -11,6 +11,7 @@ Usage:
     python3 analyze-day.py 2025/07/15 --provider ollama --model llama3.2-vision
     python3 analyze-day.py 2025/07/15 --limit 20
     python3 analyze-day.py 2025/07/15 --reanalyze
+    python3 analyze-day.py 2025/07/15 --rename-only
 """
 
 from __future__ import annotations
@@ -945,11 +946,16 @@ def main() -> None:
         action="store_true",
         help="Skip renaming best-pick images to descriptive filenames",
     )
+    parser.add_argument(
+        "--rename-only",
+        action="store_true",
+        help="Only rename already-analyzed best-pick images; skip AI analysis",
+    )
 
     args = parser.parse_args()
 
     # Validate arguments
-    if args.provider == "claude" and not args.api_key:
+    if args.provider == "claude" and not args.api_key and not args.rename_only:
         print(
             "Error: --api-key is required when using --provider claude",
             file=sys.stderr,
@@ -973,6 +979,39 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+    # --rename-only: load cached sidecars, rename best picks, regenerate markdown
+    if args.rename_only:
+        web_dir = target_dir / "web"
+        print(f"Renaming best picks in: {target_dir}")
+        print()
+
+        cached = load_cached_analysis(web_dir)
+        if not cached:
+            print(
+                "Error: No analysis sidecar files found in web/.\n"
+                "Run the analysis first before using --rename-only.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        analysis = merge_with_cached(None, cached)
+        renamed = rename_best_picks(target_dir, analysis)
+
+        if renamed:
+            print(f"Renamed {len(renamed)} image(s):")
+            for old, new in renamed.items():
+                print(f"  {old} → {new}")
+        else:
+            print("Nothing to rename (all best picks already have descriptive names).")
+
+        print()
+        print("Regenerating markdown...")
+        md_path = generate_markdown(
+            analysis, args.path, target_dir, model, args.provider, renamed
+        )
+        print(f"  Markdown: {md_path.relative_to(PICTURES_DIR)}")
+        return
 
     print(f"Analyzing: {target_dir}")
     print(f"Provider:  {args.provider}")

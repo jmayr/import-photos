@@ -18,7 +18,9 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import re
 import sys
+import unicodedata
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -538,6 +540,155 @@ def merge_with_cached(
 
 
 # ---------------------------------------------------------------------------
+# Rename best picks
+# ---------------------------------------------------------------------------
+
+
+def slugify(text: str) -> str:
+    """
+    Convert a description string into a safe, lowercase, hyphen-separated filename.
+
+    Examples:
+        "Chinesische Mauer im Sonnenuntergang" → "chinesische-mauer-im-sonnenuntergang"
+        "Café & Bäume" → "cafe-und-baeume"
+    """
+    # German umlaut / special character substitutions
+    replacements = [
+        ("ä", "ae"),
+        ("ö", "oe"),
+        ("ü", "ue"),
+        ("Ä", "Ae"),
+        ("Ö", "Oe"),
+        ("Ü", "Ue"),
+        ("ß", "ss"),
+        ("&", "und"),
+        ("@", "at"),
+        ("+", "plus"),
+    ]
+    for src, dst in replacements:
+        text = text.replace(src, dst)
+
+    # Decompose unicode and strip combining characters (accents etc.)
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+
+    # Lowercase
+    text = text.lower()
+
+    # Replace anything that isn't a letter, digit, or hyphen with a hyphen
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+
+    # Collapse multiple hyphens and strip leading/trailing ones
+    text = re.sub(r"-{2,}", "-", text).strip("-")
+
+    return text or "bild"
+
+
+def rename_best_picks(
+    day_dir: Path,
+    analysis: dict[str, Any],
+) -> dict[str, str]:
+    """
+    Rename web/ JPEG previews for best-pick and best-overall images.
+
+    The new filename is derived from the image's AI description via slugify().
+    If two images produce the same slug, a numeric suffix (-2, -3, …) is appended.
+
+    Also renames the corresponding .analysis.json sidecar file.
+
+    Returns a mapping {old_filename: new_filename} for every renamed image.
+    """
+    web_dir = day_dir / "web"
+
+    # Collect filenames to rename: all best picks + best overall
+    to_rename: list[str] = []
+    seen: set[str] = set()
+
+    for group in analysis.get("groups", []):
+        for fn in group.get("best_picks", []):
+            if fn not in seen:
+                to_rename.append(fn)
+                seen.add(fn)
+
+    best_overall = analysis.get("best_overall", {})
+    if best_overall:
+        fn = best_overall.get("filename", "")
+        if fn and fn not in seen:
+            to_rename.append(fn)
+            seen.add(fn)
+
+    # Build description lookup from analysis images list
+    desc_lookup: dict[str, str] = {
+        img["filename"]: img.get("description", "")
+        for img in analysis.get("images", [])
+        if img.get("filename")
+    }
+
+    # Track slugs already assigned in this run to avoid collisions
+    used_slugs: dict[str, int] = {}  # slug → next available counter
+    renamed: dict[str, str] = {}
+
+    for old_filename in to_rename:
+        old_path = web_dir / old_filename
+        if not old_path.exists():
+            print(
+                f"  Warning: Cannot rename {old_filename} — file not found in web/",
+                file=sys.stderr,
+            )
+            continue
+
+        description = desc_lookup.get(old_filename, "")
+        if not description:
+            # Fall back to original stem if no description available
+            description = Path(old_filename).stem
+
+        base_slug = slugify(description)
+
+        # Resolve collision
+        if base_slug not in used_slugs:
+            slug = base_slug
+            used_slugs[base_slug] = 2  # next suffix if another collision occurs
+        else:
+            suffix = used_slugs[base_slug]
+            slug = f"{base_slug}-{suffix}"
+            used_slugs[base_slug] = suffix + 1
+
+        new_filename = f"{slug}.jpg"
+        new_path = web_dir / new_filename
+
+        # Skip if already has the right name
+        if old_path == new_path:
+            continue
+
+        # Avoid overwriting an unrelated existing file
+        if new_path.exists():
+            print(
+                f"  Warning: Cannot rename {old_filename} → {new_filename} "
+                f"(target already exists), skipping",
+                file=sys.stderr,
+            )
+            continue
+
+        try:
+            old_path.rename(new_path)
+            renamed[old_filename] = new_filename
+
+            # Rename sidecar too, if it exists
+            old_sidecar = web_dir / f"{Path(old_filename).stem}.jpg.analysis.json"
+            new_sidecar = web_dir / f"{slug}.jpg.analysis.json"
+            if old_sidecar.exists():
+                old_sidecar.rename(new_sidecar)
+
+        except Exception as e:
+            print(
+                f"  Warning: Could not rename {old_filename}: {e}",
+                file=sys.stderr,
+            )
+
+    return renamed
+
+
+# ---------------------------------------------------------------------------
 # Save analysis results
 # ---------------------------------------------------------------------------
 
@@ -610,10 +761,21 @@ def generate_markdown(
     day_dir: Path,
     model: str,
     provider: str,
+    renamed: dict[str, str] | None = None,
 ) -> Path:
     """
     Generate markdown summary file in the month folder.
+
+    renamed: optional mapping {old_filename: new_filename} from rename_best_picks().
+             When provided, renamed files are shown under their new name.
     """
+    if renamed is None:
+        renamed = {}
+
+    def display_name(filename: str) -> str:
+        """Return the display name for a filename (new name if renamed)."""
+        return renamed.get(filename, filename)
+
     # Parse date to get month folder
     date_parts = date_str.split("/")
     if len(date_parts) != 3:
@@ -645,7 +807,9 @@ def generate_markdown(
         rating = best_overall.get("rating", 0)
         filename = best_overall.get("filename", "")
         reason = best_overall.get("reason", "")
-        lines.append(f"- **Best overall:** {filename} ({rating}) - {reason}")
+        lines.append(
+            f"- **Best overall:** {display_name(filename)} ({rating}) - {reason}"
+        )
 
     lines.append(f"- **Model:** {provider}/{model}")
     lines.append("")
@@ -678,7 +842,7 @@ def generate_markdown(
                 )
                 rating = bp_data.get("rating", 0)
                 desc = bp_data.get("description", "")
-                lines.append(f"- {bp_filename} ({rating}) - {desc}")
+                lines.append(f"- {display_name(bp_filename)} ({rating}) - {desc}")
             lines.append("")
 
         # All images (sorted by rating)
@@ -695,7 +859,7 @@ def generate_markdown(
         group_images.sort(key=lambda x: -x[1])  # Sort by rating descending
 
         for j, (fn, rating, desc) in enumerate(group_images, 1):
-            lines.append(f"{j}. {fn} ({rating}) - {desc}")
+            lines.append(f"{j}. {display_name(fn)} ({rating}) - {desc}")
 
         lines.append("")
 
@@ -776,6 +940,11 @@ def main() -> None:
         action="store_true",
         help="Re-analyze all images even if sidecar files already exist",
     )
+    parser.add_argument(
+        "--no-rename",
+        action="store_true",
+        help="Skip renaming best-pick images to descriptive filenames",
+    )
 
     args = parser.parse_args()
 
@@ -840,8 +1009,14 @@ def main() -> None:
     if not new_images:
         print("All images already analyzed. Regenerating markdown from cache...")
         analysis = merge_with_cached(None, cached)
+
+        # Rename best picks
+        renamed: dict[str, str] = {}
+        if not args.no_rename:
+            renamed = rename_best_picks(target_dir, analysis)
+
         md_path = generate_markdown(
-            analysis, args.path, target_dir, model, args.provider
+            analysis, args.path, target_dir, model, args.provider, renamed
         )
         images_count = len(analysis.get("images", []))
         groups_count = len(analysis.get("groups", []))
@@ -854,6 +1029,10 @@ def main() -> None:
             print(
                 f"  Best overall:     {best_overall.get('filename')} ({best_overall.get('rating')})"
             )
+        if renamed:
+            print(f"  Renamed:          {len(renamed)} image(s)")
+            for old, new in renamed.items():
+                print(f"    {old} → {new}")
         print(f"  Markdown:         {md_path.relative_to(PICTURES_DIR)}")
         print("=" * 50)
         return
@@ -891,8 +1070,16 @@ def main() -> None:
     # Save sidecar files for new images only
     save_sidecar_files(target_dir, new_analysis, model, args.provider)
 
+    # Rename best picks to descriptive filenames
+    renamed = {}
+    if not args.no_rename:
+        print("Renaming best picks...")
+        renamed = rename_best_picks(target_dir, analysis)
+
     # Generate markdown
-    md_path = generate_markdown(analysis, args.path, target_dir, model, args.provider)
+    md_path = generate_markdown(
+        analysis, args.path, target_dir, model, args.provider, renamed
+    )
 
     # Print summary
     images_count = len(analysis.get("images", []))
@@ -909,6 +1096,10 @@ def main() -> None:
         print(
             f"  Best overall:     {best_overall.get('filename')} ({best_overall.get('rating')})"
         )
+    if renamed:
+        print(f"  Renamed:          {len(renamed)} image(s)")
+        for old, new in renamed.items():
+            print(f"    {old} → {new}")
     print(f"  Markdown:         {md_path.relative_to(PICTURES_DIR)}")
     print("=" * 50)
 

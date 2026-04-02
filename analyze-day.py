@@ -109,7 +109,11 @@ def analyze_with_claude(
 
     client = Anthropic(api_key=api_key)
 
-    prompt = f"""Analyze these {len(images)} photos from {date_str}. Return JSON with this exact structure:
+    prompt = f"""Analyze these {len(images)} photos from {date_str}.
+
+Each image is labeled with its exact filename immediately before it in this message — use those filenames exactly as written in your JSON response.
+
+Return JSON with this exact structure:
 
 {{
   "images": [
@@ -128,20 +132,22 @@ def analyze_with_claude(
 }}
 
 Requirements:
+- Use the exact filenames provided before each image — do not invent or modify them
 - Group by: location changes, visual similarity, time gaps, activity changes
 - Best picks per group: 1-3 images with maximum variety/coverage
 - Ratings: 1.0-10.0 scale with decimals allowed
-- All filenames must match exactly what was provided
 - Include all images in groups
 - Order images within groups by rating (highest first)
 
 Return ONLY valid JSON, no additional text."""
 
-    # Build message content with images
+    # Build message content with images — interleave filename label before each image
+    # so the AI knows the exact filename to use in its JSON response.
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
 
     print(f"  Encoding images (this may take a moment)...")
     for i, (filename, img_bytes) in enumerate(images, 1):
+        content.append({"type": "text", "text": f"Image {i}: {filename}"})
         content.append(
             {
                 "type": "image",
@@ -279,7 +285,18 @@ def _analyze_ollama_batch(
     import requests
 
     batch_info = f" (batch {batch_num}/{total_batches})" if total_batches > 1 else ""
-    prompt = f"""Analyze these {len(images)} photos from {date_str}{batch_info}. Return JSON with this exact structure:
+
+    # Build an explicit ordered filename list so the AI can use the real names.
+    filename_list = "\n".join(
+        f"{i}. {filename}" for i, (filename, _) in enumerate(images, 1)
+    )
+
+    prompt = f"""Analyze these {len(images)} photos from {date_str}{batch_info}.
+
+The images are provided in this exact order with these filenames — use them exactly as written:
+{filename_list}
+
+Return JSON with this exact structure:
 
 {{
   "images": [
@@ -298,10 +315,10 @@ def _analyze_ollama_batch(
 }}
 
 Requirements:
+- Use the exact filenames listed above — do not invent or modify them
 - Group by: location changes, visual similarity, time gaps, activity changes
 - Best picks per group: 1-3 images with maximum variety/coverage
 - Ratings: 1.0-10.0 scale with decimals allowed
-- All filenames must match exactly what was provided
 - Include all images in groups
 - Order images within groups by rating (highest first)
 {f"- This is batch {batch_num} of {total_batches} - focus on grouping within this batch only" if total_batches > 1 else ""}
